@@ -1,0 +1,96 @@
+name: Build Release Container (Azure)
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish
+        required: true
+        type: string
+
+env:
+  REGISTRY: ${{ vars.ACR_REGISTRY }}
+  FQDN: ${{ vars.ACR_REGISTRY }}/apollo-mcp-server
+  VERSION: ${{ inputs.version || github.ref_name }}
+
+jobs:
+  # Build a container for x86_64 and aarch64 linux
+  build:
+    name: Release Container (Azure)
+    strategy:
+      matrix:
+        os: ["ubuntu-24.04", "ubuntu-24.04-arm"]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - uses: nixbuild/nix-quick-install-action@v30
+        with:
+          nix_conf: ${{ env.nix_conf }}
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: build-${{ runner.os }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'flake.nix', 'flake.lock', 'rust-toolchain.toml') }}
+          restore-prefixes-first-match: build-${{ runner.os }}-
+          # We don't want to affect the cache when building the container
+          purge: false
+          save: false
+
+      - name: Azure Container Registry Login
+        uses: azure/docker-login@v2
+        with:
+          login-server: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - id: build
+        name: Build Container
+        shell: bash
+        run: |
+          nix run .#streamImage | docker image load
+          echo "id=`docker image ls -q | head -n1`" >> $GITHUB_OUTPUT
+          echo "arch=`docker image ls --format '{{ .Tag }}' | head -n1`" >> $GITHUB_OUTPUT
+
+      - id: deploy
+        name: Tag and push the container
+        env:
+          TAG: ${{ env.VERSION }}-${{ steps.build.outputs.arch }}
+        run: |
+          docker image tag "${{ steps.build.outputs.id }}" "$FQDN:$TAG"
+          docker image push "$FQDN:$TAG"
+          echo "digest=`docker manifest inspect $FQDN:$TAG --verbose | nix run --inputs-from .# nixpkgs#jq -- -r .Descriptor.digest`" >> $GITHUB_OUTPUT
+
+  bundle:
+    name: Bundle into multiarch container (Azure)
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Azure Container Registry Login
+        uses: azure/docker-login@v2
+        with:
+          login-server: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - name: Create multiarch manifest
+        run: |
+          docker manifest create $FQDN:$VERSION $FQDN:$VERSION-amd64 $FQDN:$VERSION-arm64
+          docker manifest annotate $FQDN:$VERSION $FQDN:$VERSION-amd64 --arch amd64
+          docker manifest annotate $FQDN:$VERSION $FQDN:$VERSION-arm64 --arch arm64
+
+          docker manifest create $FQDN:latest $FQDN:$VERSION-amd64 $FQDN:$VERSION-arm64
+          docker manifest annotate $FQDN:latest $FQDN:$VERSION-amd64 --arch amd64
+          docker manifest annotate $FQDN:latest $FQDN:$VERSION-arm64 --arch arm64
+      - name: Push the multiarch manifests
+        run: |
+          docker manifest push $FQDN:$VERSION
+          docker manifest push $FQDN:latest
